@@ -1,0 +1,429 @@
+#!/bin/bash
+
+# Lemur - Smart Git branch switcher
+# Version: 0.1.0
+# License: MIT
+
+set -e
+
+VERSION="0.1.0"
+LEMUR_DIR=".git/lemur"
+HISTORY_FILE="$LEMUR_DIR/history.db"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper functions
+log_error() {
+    echo -e "${RED}Error: $1${NC}" >&2
+}
+
+log_info() {
+    echo -e "${BLUE}$1${NC}"
+}
+
+log_success() {
+    echo -e "${GREEN}$1${NC}"
+}
+
+log_warning() {
+    echo -e "${YELLOW}$1${NC}"
+}
+
+show_help() {
+    cat << EOF
+Lemur - Smart Git branch switcher
+
+USAGE:
+    lemur [OPTIONS] [PATTERN]
+    lemur init
+
+COMMANDS:
+    init            Set up Lemur in the current Git repository
+
+OPTIONS:
+    -h, --help      Show this help message
+    -v, --version   Show version information
+    --dry-run       Show what branch would be selected without switching
+    --list          Show all matches for a pattern without switching
+
+EXAMPLES:
+    lemur init      Set up Lemur tracking in current repository
+    lemur           Show most used branches
+    lemur feat      Switch to best matching branch containing 'feat'
+    lemur main      Switch to main branch
+    lemur --dry-run feature  Show which branch would be selected
+    lemur --list feature    Show all branches matching 'feature'
+
+EOF
+}
+
+show_version() {
+    echo "Lemur v$VERSION"
+}
+
+check_git_repo() {
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        log_error "Not in a Git repository"
+        exit 1
+    fi
+}
+
+ensure_lemur_dir() {
+    if [ ! -d "$LEMUR_DIR" ]; then
+        mkdir -p "$LEMUR_DIR"
+    fi
+    if [ ! -f "$HISTORY_FILE" ]; then
+        touch "$HISTORY_FILE"
+    fi
+}
+
+init_lemur_repo() {
+    check_git_repo
+    
+    local git_dir=$(git rev-parse --git-dir)
+    local hooks_dir="$git_dir/hooks"
+    local post_checkout_hook="$hooks_dir/post-checkout"
+    local lemur_dir="$git_dir/lemur"
+    
+    log_info "Initializing Lemur in $(pwd)..."
+    
+    # Create lemur directory
+    if [ ! -d "$lemur_dir" ]; then
+        mkdir -p "$lemur_dir"
+        log_success "Created $lemur_dir"
+    else
+        log_info "Lemur directory already exists"
+    fi
+    
+    # Create history file
+    local history_file="$lemur_dir/history.db"
+    if [ ! -f "$history_file" ]; then
+        touch "$history_file"
+        log_success "Created history database"
+    else
+        log_info "History database already exists"
+    fi
+    
+    # Create hooks directory if it doesn't exist
+    if [ ! -d "$hooks_dir" ]; then
+        mkdir -p "$hooks_dir"
+        log_success "Created hooks directory"
+    fi
+    
+    # Handle existing post-checkout hook
+    local hook_content='#!/bin/bash
+# Lemur branch tracking hook
+echo "$(date +%s) $(git rev-parse --abbrev-ref HEAD)" >> .git/lemur/history.db'
+    
+    if [ -f "$post_checkout_hook" ]; then
+        # Check if Lemur hook is already present
+        if grep -q "Lemur branch tracking hook" "$post_checkout_hook"; then
+            log_info "Lemur hook already installed"
+        else
+            # Backup existing hook and append Lemur tracking
+            log_warning "Existing post-checkout hook found, backing up to post-checkout.backup"
+            cp "$post_checkout_hook" "$post_checkout_hook.backup"
+            
+            echo "" >> "$post_checkout_hook"
+            echo "# Lemur branch tracking hook" >> "$post_checkout_hook"
+            echo 'echo "$(date +%s) $(git rev-parse --abbrev-ref HEAD)" >> .git/lemur/history.db' >> "$post_checkout_hook"
+            log_success "Appended Lemur tracking to existing hook"
+        fi
+    else
+        # Create new post-checkout hook
+        echo "$hook_content" > "$post_checkout_hook"
+        chmod +x "$post_checkout_hook"
+        log_success "Created post-checkout hook"
+    fi
+    
+    # Log current branch to start tracking
+    local current_branch=$(git rev-parse --abbrev-ref HEAD)
+    echo "$(date +%s) $current_branch" >> "$history_file"
+    
+    echo ""
+    log_success "Lemur initialization complete!"
+    log_info "Branch tracking is now enabled for this repository."
+    log_info "Current branch '$current_branch' has been logged."
+}
+
+get_all_branches() {
+    git branch --format='%(refname:short)' | grep -v '^HEAD$' | sort
+}
+
+get_branch_score() {
+    local branch="$1"
+    local now=$(date +%s)
+    local score=0
+    
+    if [ -f "$HISTORY_FILE" ]; then
+        # Calculate score based on frequency and recency
+        # More recent switches get higher weight
+        while read -r timestamp branch_name; do
+            if [ "$branch_name" = "$branch" ]; then
+                local age=$((now - timestamp))
+                # Decay factor: newer switches get more weight
+                local weight=$(awk "BEGIN {printf \"%.2f\", exp(-$age/604800)}")  # 1 week half-life
+                score=$(awk "BEGIN {printf \"%.2f\", $score + $weight}")
+            fi
+        done < "$HISTORY_FILE"
+    fi
+    
+    echo "$score"
+}
+
+get_tracked_branches() {
+    # Get unique branch names from history database
+    if [ -f "$HISTORY_FILE" ]; then
+        awk '{print $2}' "$HISTORY_FILE" | sort -u
+    fi
+}
+
+get_ranked_branches() {
+    local pattern="$1"
+    local branches
+    
+    if [ -n "$pattern" ]; then
+        # For pattern matching, still search all branches but prioritize tracked ones
+        local all_branches=$(get_all_branches | grep -i "$pattern" || true)
+        local tracked_branches=$(get_tracked_branches | grep -i "$pattern" || true)
+        
+        # Combine but prioritize tracked branches
+        branches=$(echo -e "$tracked_branches\n$all_branches" | awk '!seen[$0]++')
+    else
+        # For listing, only show tracked branches
+        branches=$(get_tracked_branches)
+    fi
+    
+    if [ -z "$branches" ]; then
+        return 1
+    fi
+    
+    # Score and rank branches
+    local scored_branches=""
+    while IFS= read -r branch; do
+        if [ -n "$branch" ]; then
+            local score=$(get_branch_score "$branch")
+            scored_branches="$scored_branches$score $branch\n"
+        fi
+    done <<< "$branches"
+    
+    # Sort by score (descending) and return branch names
+    echo -e "$scored_branches" | sort -nr | awk '{print $2}' | head -20
+}
+
+show_branches_with_stats() {
+    local pattern="$1"
+    local branches=$(get_ranked_branches "$pattern")
+    
+    if [ -z "$branches" ]; then
+        if [ -n "$pattern" ]; then
+            log_error "No branches found matching '$pattern'"
+        else
+            log_info "No tracked branches found. Switch to some branches to start building history!"
+            log_info "Tip: Use 'git checkout <branch>' or 'lemur <pattern>' to switch branches."
+        fi
+        return 1
+    fi
+    
+    local current_branch=$(git rev-parse --abbrev-ref HEAD)
+    local count=0
+    
+    if [ -z "$pattern" ]; then
+        echo "Most used branches (tracked by Lemur):"
+    else
+        echo "Branches matching '$pattern':"
+    fi
+    while IFS= read -r branch; do
+        if [ -n "$branch" ]; then
+            count=$((count + 1))
+            local score=$(get_branch_score "$branch")
+            local stars=""
+            
+            # Convert score to star rating
+            if (( $(awk "BEGIN {print ($score >= 3)}") )); then
+                stars="★★★"
+            elif (( $(awk "BEGIN {print ($score >= 1)}") )); then
+                stars="★★"
+            elif (( $(awk "BEGIN {print ($score > 0)}") )); then
+                stars="★"
+            fi
+            
+            if [ "$branch" = "$current_branch" ]; then
+                echo -e "  ${GREEN}$count) $branch${NC} ${YELLOW}(current)${NC} $stars"
+            else
+                echo "  $count) $branch $stars"
+            fi
+        fi
+    done <<< "$branches"
+}
+
+interactive_branch_selection() {
+    local branches="$1"
+    local branch_count=$(echo "$branches" | wc -l)
+    
+    if [ "$branch_count" -eq 1 ]; then
+        echo "$branches"
+        return 0
+    fi
+    
+    echo "Multiple matches found:"
+    local count=0
+    while IFS= read -r branch; do
+        if [ -n "$branch" ]; then
+            count=$((count + 1))
+            local score=$(get_branch_score "$branch")
+            local stars=""
+            
+            if (( $(awk "BEGIN {print ($score >= 3)}") )); then
+                stars="★★★"
+            elif (( $(awk "BEGIN {print ($score >= 1)}") )); then
+                stars="★★"
+            elif (( $(awk "BEGIN {print ($score > 0)}") )); then
+                stars="★"
+            fi
+            
+            echo "  $count) $branch $stars"
+        fi
+    done <<< "$branches"
+    
+    echo -n "Select branch [1-$branch_count]: "
+    read -r selection
+    
+    if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "$branch_count" ]; then
+        echo "$branches" | sed -n "${selection}p"
+    else
+        log_error "Invalid selection"
+        return 1
+    fi
+}
+
+switch_to_branch() {
+    local branch="$1"
+    local dry_run="$2"
+    
+    if [ -z "$branch" ]; then
+        log_error "No branch specified"
+        return 1
+    fi
+    
+    # Check if branch exists
+    if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+        log_error "Branch '$branch' does not exist"
+        return 1
+    fi
+    
+    if [ "$dry_run" = "true" ]; then
+        echo "$branch"
+        return 0
+    fi
+    
+    local current_branch=$(git rev-parse --abbrev-ref HEAD)
+    if [ "$branch" = "$current_branch" ]; then
+        log_info "Already on branch '$branch'"
+        return 0
+    fi
+    
+    if git checkout "$branch" 2>/dev/null; then
+        log_success "Switched to branch '$branch'"
+    else
+        log_error "Failed to switch to branch '$branch'"
+        return 1
+    fi
+}
+
+main() {
+    local pattern=""
+    local dry_run=false
+    local list_matches=false
+    local command=""
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -v|--version)
+                show_version
+                exit 0
+                ;;
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
+            --list)
+                list_matches=true
+                shift
+                ;;
+            init)
+                command="init"
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                echo "Use 'lemur --help' for usage information."
+                exit 1
+                ;;
+            *)
+                pattern="$1"
+                shift
+                ;;
+        esac
+    done
+    
+    # Handle init command
+    if [ "$command" = "init" ]; then
+        init_lemur_repo
+        return 0
+    fi
+    
+    check_git_repo
+    ensure_lemur_dir
+    
+    # If no pattern provided, show branch list
+    if [ -z "$pattern" ]; then
+        show_branches_with_stats
+        return 0
+    fi
+    
+    # Find matching branches
+    local branches=$(get_ranked_branches "$pattern")
+    
+    if [ -z "$branches" ]; then
+        log_error "No branches found matching '$pattern'"
+        return 1
+    fi
+    
+    # If --list flag is used, show matches and exit
+    if [ "$list_matches" = "true" ]; then
+        show_branches_with_stats "$pattern"
+        return 0
+    fi
+    
+    # Count matches
+    local match_count=$(echo "$branches" | wc -l)
+    
+    if [ "$match_count" -eq 1 ]; then
+        # Single match - switch directly
+        local branch=$(echo "$branches" | head -1)
+        switch_to_branch "$branch" "$dry_run"
+    else
+        # Multiple matches - pick the top one (most used)
+        local top_branch=$(echo "$branches" | head -1)
+        if [ "$dry_run" = "true" ]; then
+            echo "$top_branch"
+        else
+            log_info "Multiple matches found, switching to most used: '$top_branch'"
+            switch_to_branch "$top_branch" "$dry_run"
+        fi
+    fi
+}
+
+# Run main function with all arguments
+main "$@"
