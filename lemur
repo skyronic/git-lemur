@@ -6,9 +6,26 @@
 
 set -e
 
-VERSION="0.1.0"
-LEMUR_DIR=".git/lemur"
-HISTORY_FILE="$LEMUR_DIR/history.db"
+VERSION="0.1.1"
+
+# Get the absolute path to the git repository root
+get_git_root() {
+    git rev-parse --show-toplevel 2>/dev/null
+}
+
+# Initialize paths based on git root
+init_paths() {
+    local git_root=$(get_git_root)
+    if [ -z "$git_root" ]; then
+        log_error "Not in a Git repository"
+        exit 1
+    fi
+    LEMUR_DIR="$git_root/.git/lemur"
+    HISTORY_FILE="$LEMUR_DIR/history.db"
+}
+
+# Call init_paths early, but we'll also call it in functions that need it
+init_paths
 
 # Colors for output
 RED='\033[0;31m'
@@ -84,8 +101,10 @@ ensure_lemur_dir() {
 
 init_lemur_repo() {
     check_git_repo
+    init_paths
     
-    local git_dir=$(git rev-parse --git-dir)
+    local git_root=$(get_git_root)
+    local git_dir="$git_root/.git"
     local hooks_dir="$git_dir/hooks"
     local post_checkout_hook="$hooks_dir/post-checkout"
     local lemur_dir="$git_dir/lemur"
@@ -116,9 +135,9 @@ init_lemur_repo() {
     fi
     
     # Handle existing post-checkout hook
-    local hook_content='#!/bin/bash
+    local hook_content="#!/bin/bash
 # Lemur branch tracking hook
-echo "$(date +%s) $(git rev-parse --abbrev-ref HEAD)" >> .git/lemur/history.db'
+echo \"\$(date +%s) \$(git rev-parse --abbrev-ref HEAD)\" >> \"$git_root/.git/lemur/history.db\""
     
     if [ -f "$post_checkout_hook" ]; then
         # Check if Lemur hook is already present
@@ -131,7 +150,7 @@ echo "$(date +%s) $(git rev-parse --abbrev-ref HEAD)" >> .git/lemur/history.db'
             
             echo "" >> "$post_checkout_hook"
             echo "# Lemur branch tracking hook" >> "$post_checkout_hook"
-            echo 'echo "$(date +%s) $(git rev-parse --abbrev-ref HEAD)" >> .git/lemur/history.db' >> "$post_checkout_hook"
+            echo "echo \"\$(date +%s) \$(git rev-parse --abbrev-ref HEAD)\" >> \"$git_root/.git/lemur/history.db\"" >> "$post_checkout_hook"
             log_success "Appended Lemur tracking to existing hook"
         fi
     else
@@ -384,6 +403,7 @@ main() {
     fi
     
     check_git_repo
+    init_paths
     ensure_lemur_dir
     
     # If no pattern provided, show branch list
